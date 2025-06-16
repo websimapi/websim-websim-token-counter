@@ -287,8 +287,26 @@
         }
         
         function calculateTokens(projectData, htmlContent, assets, assetContents) {
-            // Simple token estimation (roughly 4 characters per token for English text)
-            const estimateTokens = (text) => Math.ceil((text || '').length / 4);
+            // More accurate token estimation using word-based counting for different content types
+            const estimateTokens = (text, contentType = 'text') => {
+                if (!text) return 0;
+                
+                // Clean the text
+                const cleanText = text.trim();
+                if (!cleanText) return 0;
+                
+                if (contentType === 'code' || contentType === 'html') {
+                    // For code content, count more accurately by considering syntax
+                    // Code typically has shorter tokens due to symbols and keywords
+                    const words = cleanText.split(/\s+/);
+                    const symbols = (cleanText.match(/[{}();.,=<>\/\-+*&|!@#$%^]/g) || []).length;
+                    return Math.ceil(words.length * 0.8 + symbols * 0.3);
+                } else {
+                    // For regular text, use GPT-style estimation (roughly 0.75 tokens per word)
+                    const words = cleanText.split(/\s+/).filter(word => word.length > 0);
+                    return Math.ceil(words.length * 0.75);
+                }
+            };
             
             const analysis = {
                 prompt: 0,
@@ -297,7 +315,11 @@
                 description: 0,
                 javascript: 0,
                 css: 0,
+                json: 0,
+                text: 0,
                 other: 0,
+                lore: 0,
+                metadata: 0,
                 total: 0,
                 assetBreakdown: {}
             };
@@ -307,9 +329,15 @@
                 analysis.prompt = estimateTokens(projectData.site.prompt.text);
             }
             
+            // Analyze lore data if available (this contains context and features)
+            if (projectData.site?.lore) {
+                const loreText = JSON.stringify(projectData.site.lore);
+                analysis.lore = estimateTokens(loreText, 'code');
+            }
+            
             // Analyze HTML content
             if (htmlContent) {
-                analysis.html = estimateTokens(htmlContent);
+                analysis.html = estimateTokens(htmlContent, 'html');
             }
             
             // Analyze title and description
@@ -321,29 +349,75 @@
                 analysis.description = estimateTokens(projectData.project.description);
             }
             
-            // Analyze assets by type
+            // Analyze project metadata that might be sent to AI
+            const metadataFields = [
+                projectData.site?.title,
+                projectData.site?.yapping,
+                projectData.project?.slug
+            ].filter(Boolean);
+            
+            if (metadataFields.length > 0) {
+                analysis.metadata = estimateTokens(metadataFields.join(' '));
+            }
+            
+            // Analyze assets by type with more accurate categorization
             for (const asset of assets) {
                 const content = assetContents[asset.path] || '';
-                const tokens = estimateTokens(content);
+                const contentType = asset.content_type?.toLowerCase() || '';
+                const path = asset.path.toLowerCase();
+                
+                let tokens = 0;
+                let category = 'other';
+                
+                // Determine content type and calculate tokens accordingly
+                if (contentType.includes('javascript') || path.endsWith('.js') || path.endsWith('.mjs')) {
+                    tokens = estimateTokens(content, 'code');
+                    category = 'javascript';
+                } else if (contentType.includes('css') || path.endsWith('.css')) {
+                    tokens = estimateTokens(content, 'code');
+                    category = 'css';
+                } else if (contentType.includes('json') || path.endsWith('.json')) {
+                    tokens = estimateTokens(content, 'code');
+                    category = 'json';
+                } else if (contentType.includes('text') || path.endsWith('.txt') || path.endsWith('.md')) {
+                    tokens = estimateTokens(content);
+                    category = 'text';
+                } else if (contentType.includes('html') || path.endsWith('.html')) {
+                    tokens = estimateTokens(content, 'html');
+                    category = 'other';
+                } else {
+                    // For binary files or unknown types, estimate based on size
+                    // Assume some compression ratio for binary content
+                    tokens = Math.ceil(asset.size / 8); // Very rough estimate for binary
+                    category = 'other';
+                }
+                
+                // Include asset metadata (title, description) if available
+                let assetMetadataTokens = 0;
+                if (asset.meta?.title) {
+                    assetMetadataTokens += estimateTokens(asset.meta.title);
+                }
+                if (asset.meta?.description) {
+                    assetMetadataTokens += estimateTokens(asset.meta.description);
+                }
+                
+                const totalAssetTokens = tokens + assetMetadataTokens;
                 
                 analysis.assetBreakdown[asset.path] = {
-                    tokens,
+                    tokens: totalAssetTokens,
+                    contentTokens: tokens,
+                    metadataTokens: assetMetadataTokens,
                     contentType: asset.content_type,
-                    size: asset.size
+                    size: asset.size,
+                    category
                 };
                 
-                // Categorize by content type
-                if (asset.content_type?.includes('javascript') || asset.path.endsWith('.js')) {
-                    analysis.javascript += tokens;
-                } else if (asset.content_type?.includes('css') || asset.path.endsWith('.css')) {
-                    analysis.css += tokens;
-                } else {
-                    analysis.other += tokens;
-                }
+                analysis[category] += totalAssetTokens;
             }
             
             analysis.total = analysis.prompt + analysis.html + analysis.title + analysis.description + 
-                           analysis.javascript + analysis.css + analysis.other;
+                           analysis.javascript + analysis.css + analysis.json + analysis.text + 
+                           analysis.other + analysis.lore + analysis.metadata;
             
             return analysis;
         }
@@ -355,23 +429,37 @@
             const site = projectData.site;
             const revision = projectData.project_revision;
             
-            // Create asset breakdown HTML
+            // Create asset breakdown HTML with better categorization
             let assetBreakdownHtml = '';
             if (assets.length > 0) {
+                const categories = {};
+                Object.entries(tokenAnalysis.assetBreakdown).forEach(([path, data]) => {
+                    if (!categories[data.category]) {
+                        categories[data.category] = [];
+                    }
+                    categories[data.category].push({ path, ...data });
+                });
+                
                 assetBreakdownHtml = `
                     <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
-                        <h3 style="margin: 0 0 16px 0; font-size: 1.2rem; color: #374151;">Asset Breakdown</h3>
-                        <div style="display: grid; gap: 8px;">
-                            ${Object.entries(tokenAnalysis.assetBreakdown).map(([path, data]) => `
-                                <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #f9fafb; border-radius: 6px; font-size: 0.9rem;">
-                                    <span style="font-family: 'Space Mono', monospace; color: #374151;">${path}</span>
-                                    <div style="display: flex; gap: 12px; align-items: center;">
-                                        <span style="color: #6b7280; font-size: 0.8rem;">${data.contentType}</span>
-                                        <span style="color: #3b82f6; font-weight: 600;">${data.tokens} tokens</span>
-                                    </div>
+                        <h3 style="margin: 0 0 16px 0; font-size: 1.2rem; color: #374151;">Asset Breakdown by Category</h3>
+                        ${Object.entries(categories).map(([category, files]) => `
+                            <div style="margin-bottom: 20px;">
+                                <h4 style="margin: 0 0 8px 0; font-size: 1rem; color: #4b5563; text-transform: capitalize;">${category} Files (${files.reduce((sum, f) => sum + f.tokens, 0)} tokens)</h4>
+                                <div style="display: grid; gap: 6px;">
+                                    ${files.map(file => `
+                                        <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; background: #f9fafb; border-radius: 6px; font-size: 0.85rem;">
+                                            <span style="font-family: 'Space Mono', monospace; color: #374151;">${file.path}</span>
+                                            <div style="display: flex; gap: 12px; align-items: center;">
+                                                <span style="color: #6b7280; font-size: 0.75rem;">${(file.size / 1024).toFixed(1)}KB</span>
+                                                ${file.metadataTokens > 0 ? `<span style="color: #f59e0b; font-size: 0.75rem;">+${file.metadataTokens} meta</span>` : ''}
+                                                <span style="color: #3b82f6; font-weight: 600;">${file.tokens} tokens</span>
+                                            </div>
+                                        </div>
+                                    `).join('')}
                                 </div>
-                            `).join('')}
-                        </div>
+                            </div>
+                        `).join('')}
                     </div>
                 `;
             }
@@ -398,27 +486,42 @@
                         
                         <div class="token-card">
                             <span class="token-number">${tokenAnalysis.html}</span>
-                            <div class="token-label">HTML Content Tokens</div>
+                            <div class="token-label">HTML Content</div>
                         </div>
                         
                         <div class="token-card">
                             <span class="token-number">${tokenAnalysis.javascript}</span>
-                            <div class="token-label">JavaScript Tokens</div>
+                            <div class="token-label">JavaScript Files</div>
                         </div>
                         
                         <div class="token-card">
                             <span class="token-number">${tokenAnalysis.css}</span>
-                            <div class="token-label">CSS Tokens</div>
+                            <div class="token-label">CSS Files</div>
+                        </div>
+                        
+                        <div class="token-card">
+                            <span class="token-number">${tokenAnalysis.json}</span>
+                            <div class="token-label">JSON/Config Files</div>
+                        </div>
+                        
+                        <div class="token-card">
+                            <span class="token-number">${tokenAnalysis.text}</span>
+                            <div class="token-label">Text/Markdown Files</div>
                         </div>
                         
                         <div class="token-card">
                             <span class="token-number">${tokenAnalysis.other}</span>
-                            <div class="token-label">Other Assets Tokens</div>
+                            <div class="token-label">Other Assets</div>
                         </div>
                         
                         <div class="token-card">
-                            <span class="token-number">${tokenAnalysis.title + tokenAnalysis.description}</span>
-                            <div class="token-label">Title + Description</div>
+                            <span class="token-number">${tokenAnalysis.lore}</span>
+                            <div class="token-label">Lore/Context Data</div>
+                        </div>
+                        
+                        <div class="token-card">
+                            <span class="token-number">${tokenAnalysis.title + tokenAnalysis.description + tokenAnalysis.metadata}</span>
+                            <div class="token-label">Metadata & Titles</div>
                         </div>
                         
                         <div class="token-card" style="grid-column: 1 / -1; background: #eff6ff; border-color: #bfdbfe;">
@@ -431,10 +534,14 @@
                     
                     ${site?.prompt ? `
                         <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
-                            <h3 style="margin: 0 0 12px 0; font-size: 1.2rem; color: #374151;">Original Prompt</h3>
+                            <h3 style="margin: 0 0 12px 0; font-size: 1.2rem; color: #374151;">Original Prompt (${tokenAnalysis.prompt} tokens)</h3>
                             <div style="background: #f9fafb; padding: 16px; border-radius: 8px; border: 1px solid #e5e7eb; font-family: 'Space Mono', monospace; font-size: 0.9rem; white-space: pre-wrap; max-height: 300px; overflow-y: auto;">${site.prompt.text}</div>
                         </div>
                     ` : ''}
+                    
+                    <div style="margin-top: 20px; padding: 16px; background: #f0f9ff; border-radius: 8px; border: 1px solid #bae6fd; font-size: 0.9rem; color: #0c4a6e;">
+                        <strong>Token Calculation Method:</strong> Uses word-based counting with different multipliers for code vs text content. Includes asset metadata, lore/context data, and project metadata that may be sent to AI models during generation.
+                    </div>
                 </div>
             `;
         }
