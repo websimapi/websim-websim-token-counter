@@ -249,16 +249,44 @@
                     }
                 }
                 
+                // Fetch all project assets (JS, CSS, etc.)
+                let assets = [];
+                let assetContents = {};
+                if (projectData.project_revision) {
+                    try {
+                        const assetsResponse = await fetch(`/api/v1/projects/${projectId}/revisions/${projectData.project_revision.version}/assets`);
+                        if (assetsResponse.ok) {
+                            const assetsData = await assetsResponse.json();
+                            assets = assetsData.assets || [];
+                            
+                            // Fetch content for each asset
+                            for (const asset of assets) {
+                                try {
+                                    const contentResponse = await fetch(`/api/v1/projects/${projectId}/revisions/${projectData.project_revision.version}/assets/${encodeURIComponent(asset.path)}/content`);
+                                    if (contentResponse.ok) {
+                                        const contentData = await contentResponse.json();
+                                        assetContents[asset.path] = contentData.content;
+                                    }
+                                } catch (e) {
+                                    console.warn(`Could not fetch content for asset ${asset.path}:`, e);
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.warn('Could not fetch assets:', e);
+                    }
+                }
+                
                 // Calculate token estimates
-                const tokenAnalysis = calculateTokens(projectData, htmlContent);
-                displayResults(projectData, tokenAnalysis);
+                const tokenAnalysis = calculateTokens(projectData, htmlContent, assets, assetContents);
+                displayResults(projectData, tokenAnalysis, assets);
                 
             } catch (error) {
                 showError(error.message);
             }
         }
         
-        function calculateTokens(projectData, htmlContent) {
+        function calculateTokens(projectData, htmlContent, assets, assetContents) {
             // Simple token estimation (roughly 4 characters per token for English text)
             const estimateTokens = (text) => Math.ceil((text || '').length / 4);
             
@@ -267,7 +295,11 @@
                 html: 0,
                 title: 0,
                 description: 0,
-                total: 0
+                javascript: 0,
+                css: 0,
+                other: 0,
+                total: 0,
+                assetBreakdown: {}
             };
             
             // Analyze prompt if available
@@ -289,17 +321,60 @@
                 analysis.description = estimateTokens(projectData.project.description);
             }
             
-            analysis.total = analysis.prompt + analysis.html + analysis.title + analysis.description;
+            // Analyze assets by type
+            for (const asset of assets) {
+                const content = assetContents[asset.path] || '';
+                const tokens = estimateTokens(content);
+                
+                analysis.assetBreakdown[asset.path] = {
+                    tokens,
+                    contentType: asset.content_type,
+                    size: asset.size
+                };
+                
+                // Categorize by content type
+                if (asset.content_type?.includes('javascript') || asset.path.endsWith('.js')) {
+                    analysis.javascript += tokens;
+                } else if (asset.content_type?.includes('css') || asset.path.endsWith('.css')) {
+                    analysis.css += tokens;
+                } else {
+                    analysis.other += tokens;
+                }
+            }
+            
+            analysis.total = analysis.prompt + analysis.html + analysis.title + analysis.description + 
+                           analysis.javascript + analysis.css + analysis.other;
             
             return analysis;
         }
         
-        function displayResults(projectData, tokenAnalysis) {
+        function displayResults(projectData, tokenAnalysis, assets) {
             const resultsDiv = document.getElementById('results');
             
             const project = projectData.project;
             const site = projectData.site;
             const revision = projectData.project_revision;
+            
+            // Create asset breakdown HTML
+            let assetBreakdownHtml = '';
+            if (assets.length > 0) {
+                assetBreakdownHtml = `
+                    <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+                        <h3 style="margin: 0 0 16px 0; font-size: 1.2rem; color: #374151;">Asset Breakdown</h3>
+                        <div style="display: grid; gap: 8px;">
+                            ${Object.entries(tokenAnalysis.assetBreakdown).map(([path, data]) => `
+                                <div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: #f9fafb; border-radius: 6px; font-size: 0.9rem;">
+                                    <span style="font-family: 'Space Mono', monospace; color: #374151;">${path}</span>
+                                    <div style="display: flex; gap: 12px; align-items: center;">
+                                        <span style="color: #6b7280; font-size: 0.8rem;">${data.contentType}</span>
+                                        <span style="color: #3b82f6; font-weight: 600;">${data.tokens} tokens</span>
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+            }
             
             resultsDiv.innerHTML = `
                 <div class="results">
@@ -309,7 +384,8 @@
                             Project ID: ${project.id} | 
                             Version: ${revision?.version || 'N/A'} | 
                             Created: ${new Date(project.created_at).toLocaleDateString()} |
-                            Views: ${project.stats?.views || 0}
+                            Views: ${project.stats?.views || 0} |
+                            Assets: ${assets.length}
                         </div>
                         ${project.description ? `<p style="margin-top: 12px; color: #4b5563;">${project.description}</p>` : ''}
                     </div>
@@ -326,13 +402,23 @@
                         </div>
                         
                         <div class="token-card">
-                            <span class="token-number">${tokenAnalysis.title}</span>
-                            <div class="token-label">Title Tokens</div>
+                            <span class="token-number">${tokenAnalysis.javascript}</span>
+                            <div class="token-label">JavaScript Tokens</div>
                         </div>
                         
                         <div class="token-card">
-                            <span class="token-number">${tokenAnalysis.description}</span>
-                            <div class="token-label">Description Tokens</div>
+                            <span class="token-number">${tokenAnalysis.css}</span>
+                            <div class="token-label">CSS Tokens</div>
+                        </div>
+                        
+                        <div class="token-card">
+                            <span class="token-number">${tokenAnalysis.other}</span>
+                            <div class="token-label">Other Assets Tokens</div>
+                        </div>
+                        
+                        <div class="token-card">
+                            <span class="token-number">${tokenAnalysis.title + tokenAnalysis.description}</span>
+                            <div class="token-label">Title + Description</div>
                         </div>
                         
                         <div class="token-card" style="grid-column: 1 / -1; background: #eff6ff; border-color: #bfdbfe;">
@@ -340,6 +426,8 @@
                             <div class="token-label" style="color: #1e40af; font-weight: 600;">Total Estimated Tokens</div>
                         </div>
                     </div>
+                    
+                    ${assetBreakdownHtml}
                     
                     ${site?.prompt ? `
                         <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
@@ -383,4 +471,3 @@
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>
-
