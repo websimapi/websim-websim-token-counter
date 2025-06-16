@@ -287,24 +287,37 @@
         }
         
         function calculateTokens(projectData, htmlContent, assets, assetContents) {
-            // More accurate token estimation using word-based counting for different content types
+            // More accurate token estimation that better matches GPT tokenization
             const estimateTokens = (text, contentType = 'text') => {
                 if (!text) return 0;
                 
-                // Clean the text
                 const cleanText = text.trim();
                 if (!cleanText) return 0;
                 
-                if (contentType === 'code' || contentType === 'html') {
-                    // For code content, count more accurately by considering syntax
-                    // Code typically has shorter tokens due to symbols and keywords
-                    const words = cleanText.split(/\s+/);
-                    const symbols = (cleanText.match(/[{}();.,=<>\/\-+*&|!@#$%^]/g) || []).length;
-                    return Math.ceil(words.length * 0.8 + symbols * 0.3);
+                if (contentType === 'html') {
+                    // HTML has lots of tags, attributes, and structure
+                    // Count tags, attributes, and text content separately
+                    const tagMatches = (cleanText.match(/<[^>]+>/g) || []).length;
+                    const textContent = cleanText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+                    const words = textContent ? textContent.split(/\s+/).length : 0;
+                    
+                    // HTML tokens: tags count as ~1.5 tokens each, text as ~1.3 tokens per word
+                    return Math.ceil(tagMatches * 1.5 + words * 1.3);
+                } else if (contentType === 'code') {
+                    // Code content uses more precise tokenization
+                    // Split on whitespace AND common programming symbols
+                    const tokens = cleanText.split(/[\s\n\r\t;,\.\(\)\{\}\[\]=\+\-\*\/\\<>:"'`!@#\$%\^&\|~]+/)
+                        .filter(token => token.length > 0);
+                    
+                    // Add back significant symbols as separate tokens
+                    const symbolMatches = (cleanText.match(/[;,\.\(\)\{\}\[\]=\+\-\*\/\\<>:"'`!@#\$%\^&\|~]/g) || []).length;
+                    
+                    return tokens.length + Math.ceil(symbolMatches * 0.7);
                 } else {
-                    // For regular text, use GPT-style estimation (roughly 0.75 tokens per word)
+                    // Regular text: more accurate word-to-token ratio
                     const words = cleanText.split(/\s+/).filter(word => word.length > 0);
-                    return Math.ceil(words.length * 0.75);
+                    // GPT models typically use ~1.3 tokens per word for English text
+                    return Math.ceil(words.length * 1.3);
                 }
             };
             
@@ -385,10 +398,13 @@
                 } else if (contentType.includes('html') || path.endsWith('.html')) {
                     tokens = estimateTokens(content, 'html');
                     category = 'other';
+                } else if (content.length > 0) {
+                    // For files with content but unknown type, treat as code
+                    tokens = estimateTokens(content, 'code');
+                    category = 'other';
                 } else {
-                    // For binary files or unknown types, estimate based on size
-                    // Assume some compression ratio for binary content
-                    tokens = Math.ceil(asset.size / 8); // Very rough estimate for binary
+                    // For binary files or empty files, minimal token count
+                    tokens = Math.max(1, Math.ceil(asset.size / 100));
                     category = 'other';
                 }
                 
